@@ -12,6 +12,7 @@ enum Origin {
 }
 
 pub(super) struct InscriptionUpdater<'a, 'db, 'tx> {
+  index: &'a Index,
   flotsam: Vec<Flotsam>,
   height: u64,
   id_to_satpoint: &'a mut Table<'db, 'tx, &'static InscriptionIdValue, &'static SatPointValue>,
@@ -20,6 +21,7 @@ pub(super) struct InscriptionUpdater<'a, 'db, 'tx> {
   pub(super) lost_sats: u64,
   next_number: u64,
   number_to_id: &'a mut Table<'db, 'tx, u64, &'static InscriptionIdValue>,
+  address_to_numbers: &'a mut Table<'db, 'tx, &'static str, &'static [u8]>,
   outpoint_to_value: &'a mut Table<'db, 'tx, &'static OutPointValue, u64>,
   reward: u64,
   sat_to_inscription_id: &'a mut Table<'db, 'tx, u64, &'static InscriptionIdValue>,
@@ -31,12 +33,14 @@ pub(super) struct InscriptionUpdater<'a, 'db, 'tx> {
 
 impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
   pub(super) fn new(
+    index: &'a Index,
     height: u64,
     id_to_satpoint: &'a mut Table<'db, 'tx, &'static InscriptionIdValue, &'static SatPointValue>,
     value_receiver: &'a mut Receiver<u64>,
     id_to_entry: &'a mut Table<'db, 'tx, &'static InscriptionIdValue, InscriptionEntryValue>,
     lost_sats: u64,
     number_to_id: &'a mut Table<'db, 'tx, u64, &'static InscriptionIdValue>,
+    address_to_numbers: &'a mut Table<'db, 'tx, &'static str, &'static [u8]>,
     outpoint_to_value: &'a mut Table<'db, 'tx, &'static OutPointValue, u64>,
     sat_to_inscription_id: &'a mut Table<'db, 'tx, u64, &'static InscriptionIdValue>,
     satpoint_to_id: &'a mut Table<'db, 'tx, &'static SatPointValue, &'static InscriptionIdValue>,
@@ -52,6 +56,7 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
       .unwrap_or(0);
 
     Ok(Self {
+      index,
       flotsam: Vec::new(),
       height,
       id_to_satpoint,
@@ -60,6 +65,7 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
       lost_sats,
       next_number,
       number_to_id,
+      address_to_numbers,
       outpoint_to_value,
       reward: Height(height).subsidy(),
       sat_to_inscription_id,
@@ -167,10 +173,17 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
           offset: flotsam.offset - output_value,
         };
 
+        let new_address = self
+          .index
+          .chain
+          .address_from_script(&tx_out.script_pubkey)
+          .ok();
+
         self.update_inscription_location(
           input_sat_ranges,
           inscriptions.next().unwrap(),
           new_satpoint,
+          new_address,
         )?;
       }
 
@@ -191,7 +204,7 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
           outpoint: OutPoint::null(),
           offset: self.lost_sats + flotsam.offset - output_value,
         };
-        self.update_inscription_location(input_sat_ranges, flotsam, new_satpoint)?;
+        self.update_inscription_location(input_sat_ranges, flotsam, new_satpoint, None)?;
       }
       self.lost_sats += self.reward - output_value;
       Ok(())
@@ -210,12 +223,54 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
     input_sat_ranges: Option<&VecDeque<(u64, u64)>>,
     flotsam: Flotsam,
     new_satpoint: SatPoint,
+    new_address: Option<Address>,
   ) -> Result {
     let inscription_id = flotsam.inscription_id.store();
+
+    let mut inscription_number = self.next_number;
 
     match flotsam.origin {
       Origin::Old { old_satpoint } => {
         self.satpoint_to_id.remove(&old_satpoint.store())?;
+
+        let entry = self.id_to_entry.get(&inscription_id)?.unwrap().value();
+        inscription_number = entry.2;
+
+        if let Some(old_output) = self
+          .index
+          .get_transaction(old_satpoint.outpoint.txid)?
+          .unwrap()
+          .output
+          .into_iter()
+          .nth(old_satpoint.outpoint.vout.try_into().unwrap())
+        {
+          if let Ok(old_address) = self
+            .index
+            .chain
+            .address_from_script(&old_output.script_pubkey)
+          {
+            let mut new_value = Vec::new();
+            if let Some(array) = self
+              .address_to_numbers
+              .get(old_address.to_string().as_str())?
+            {
+              let number = inscription_number.store();
+              new_value.extend_from_slice(array.value());
+              if let Some(index) = new_value.chunks_exact(8).position(|chunk| chunk == &number) {
+                new_value.drain(index * 8..(index + 1) * 8);
+              }
+            }
+            if new_value.is_empty() {
+              self
+                .address_to_numbers
+                .remove(old_address.to_string().as_str())?;
+            } else {
+              self
+                .address_to_numbers
+                .insert(old_address.to_string().as_str(), new_value.as_slice())?;
+            }
+          }
+        }
       }
       Origin::New { fee } => {
         self
@@ -254,6 +309,20 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
     }
 
     let new_satpoint = new_satpoint.store();
+
+    if let Some(new_address) = new_address {
+      let number = inscription_number.store();
+      let mut new_value = self
+        .address_to_numbers
+        .get(new_address.to_string().as_str())?
+        .map_or_else(Vec::new, |array| array.value().to_vec());
+      if !new_value.chunks_exact(8).any(|chunk| chunk == &number) {
+        new_value.extend_from_slice(&number);
+        self
+          .address_to_numbers
+          .insert(new_address.to_string().as_str(), new_value.as_slice())?;
+      }
+    }
 
     self.satpoint_to_id.insert(&new_satpoint, &inscription_id)?;
     self.id_to_satpoint.insert(&inscription_id, &new_satpoint)?;
